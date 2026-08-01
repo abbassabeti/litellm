@@ -1,7 +1,10 @@
 #### What this does ####
 #   identifies lowest tpm deployment
 import random
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import httpx
 
@@ -23,6 +26,71 @@ if TYPE_CHECKING:
     Span = Union[_Span, Any]
 else:
     Span = Any
+
+RateLimitMetric = Literal["rpm", "tpm"]
+
+
+@dataclass(frozen=True, slots=True)
+class SlidingWindowCacheKeys:
+    """
+    Cache keys + weight needed to compute a sliding-window effective count
+    from two fixed-window (per wall-clock-minute) counters.
+    """
+
+    current_key: str
+    previous_key: str
+    previous_weight: float
+
+
+def _build_sliding_window_keys(
+    model_id: str | None,
+    deployment_name: str | None,
+    metric: RateLimitMetric,
+    dt: datetime,
+) -> SlidingWindowCacheKeys:
+    """
+    Sliding window counter algorithm (as used by Cloudflare, Kong, etc.):
+    approximates a rolling window using the current and previous fixed-minute
+    counters, weighted by how much of the previous minute's window still
+    overlaps the trailing 60s from `dt`.
+    """
+    current_minute = dt.strftime("%H-%M")
+    previous_minute = (dt - timedelta(minutes=1)).strftime("%H-%M")
+    seconds_into_current_minute = dt.second + dt.microsecond / 1_000_000
+    previous_weight = 1 - (seconds_into_current_minute / 60)
+    return SlidingWindowCacheKeys(
+        current_key=f"{model_id}:{deployment_name}:{metric}:{current_minute}",
+        previous_key=f"{model_id}:{deployment_name}:{metric}:{previous_minute}",
+        previous_weight=previous_weight,
+    )
+
+
+def _effective_sliding_window_count(
+    current_count: float | None,
+    previous_count: float | None,
+    previous_weight: float,
+) -> float:
+    return (current_count or 0) + (previous_count or 0) * previous_weight
+
+
+def _get_nested(mapping: Mapping[str, Any], outer_key: str, inner_key: str) -> Any:
+    inner = mapping.get(outer_key)
+    return inner.get(inner_key) if isinstance(inner, Mapping) else None
+
+
+def _get_deployment_rate_limit(deployment: Mapping[str, Any], limit_key: RateLimitMetric) -> float:
+    """
+    A deployment's configured rpm/tpm limit can be set at 3 different levels,
+    checked in this order; falls back to unlimited if none are set.
+    """
+    for candidate in (
+        deployment.get(limit_key),
+        _get_nested(deployment, "litellm_params", limit_key),
+        _get_nested(deployment, "model_info", limit_key),
+    ):
+        if candidate is not None:
+            return candidate
+    return float("inf")
 
 
 class RoutingArgs(LiteLLMPydanticObjectBase):
@@ -71,24 +139,23 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
             # ------------
 
             dt = get_utc_datetime()
-            current_minute = dt.strftime("%H-%M")
             model_id = deployment.get("model_info", {}).get("id")
             deployment_name = deployment.get("litellm_params", {}).get("model")
-            rpm_key = f"{model_id}:{deployment_name}:rpm:{current_minute}"
+            sliding_window_keys = _build_sliding_window_keys(
+                model_id=model_id, deployment_name=deployment_name, metric="rpm", dt=dt
+            )
+            rpm_key = sliding_window_keys.current_key
 
-            local_result = self.router_cache.get_cache(key=rpm_key, local_only=True)  # check local result first
+            # check local result first (both current + previous minute buckets)
+            local_current = self.router_cache.get_cache(key=rpm_key, local_only=True)
+            local_previous = self.router_cache.get_cache(key=sliding_window_keys.previous_key, local_only=True)
+            local_result = _effective_sliding_window_count(
+                local_current, local_previous, sliding_window_keys.previous_weight
+            )
 
-            deployment_rpm = None
-            if deployment_rpm is None:
-                deployment_rpm = deployment.get("rpm")
-            if deployment_rpm is None:
-                deployment_rpm = deployment.get("litellm_params", {}).get("rpm")
-            if deployment_rpm is None:
-                deployment_rpm = deployment.get("model_info", {}).get("rpm")
-            if deployment_rpm is None:
-                deployment_rpm = float("inf")
+            deployment_rpm = _get_deployment_rate_limit(deployment, "rpm")
 
-            if local_result is not None and local_result >= deployment_rpm:
+            if local_result >= deployment_rpm:
                 raise litellm.RateLimitError(
                     message="Deployment over defined rpm limit={}. current usage={}".format(
                         deployment_rpm, local_result
@@ -114,9 +181,14 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
                 # if local result below limit, check redis ## prevent unnecessary redis checks
 
                 result = self.router_cache.increment_cache(key=rpm_key, value=1, ttl=self.routing_args.ttl)
-                if result is not None and result > deployment_rpm:
+                effective_result = _effective_sliding_window_count(
+                    result, local_previous, sliding_window_keys.previous_weight
+                )
+                if effective_result > deployment_rpm:
                     raise litellm.RateLimitError(
-                        message="Deployment over defined rpm limit={}. current usage={}".format(deployment_rpm, result),
+                        message="Deployment over defined rpm limit={}. current usage={}".format(
+                            deployment_rpm, effective_result
+                        ),
                         llm_provider="",
                         model=deployment.get("litellm_params", {}).get("model"),
                         response=httpx.Response(
@@ -124,7 +196,7 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
                             content="{} rpm limit={}. current usage={}".format(
                                 RouterErrors.user_defined_ratelimit_error.value,
                                 deployment_rpm,
-                                result,
+                                effective_result,
                             ),
                             request=httpx.Request(
                                 method="tpm_rpm_limits",
@@ -155,25 +227,24 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
             # Setup values
             # ------------
             dt = get_utc_datetime()
-            current_minute = dt.strftime("%H-%M")
             model_id = deployment.get("model_info", {}).get("id")
             deployment_name = deployment.get("litellm_params", {}).get("model")
 
-            rpm_key = f"{model_id}:{deployment_name}:rpm:{current_minute}"
-            local_result = await self.router_cache.async_get_cache(
-                key=rpm_key, local_only=True
-            )  # check local result first
+            sliding_window_keys = _build_sliding_window_keys(
+                model_id=model_id, deployment_name=deployment_name, metric="rpm", dt=dt
+            )
+            rpm_key = sliding_window_keys.current_key
 
-            deployment_rpm = None
-            if deployment_rpm is None:
-                deployment_rpm = deployment.get("rpm")
-            if deployment_rpm is None:
-                deployment_rpm = deployment.get("litellm_params", {}).get("rpm")
-            if deployment_rpm is None:
-                deployment_rpm = deployment.get("model_info", {}).get("rpm")
-            if deployment_rpm is None:
-                deployment_rpm = float("inf")
-            if local_result is not None and local_result >= deployment_rpm:
+            # check local result first (both current + previous minute buckets)
+            local_current, local_previous = await self.router_cache.async_batch_get_cache(
+                keys=[rpm_key, sliding_window_keys.previous_key], local_only=True
+            )
+            local_result = _effective_sliding_window_count(
+                local_current, local_previous, sliding_window_keys.previous_weight
+            )
+
+            deployment_rpm = _get_deployment_rate_limit(deployment, "rpm")
+            if local_result >= deployment_rpm:
                 raise litellm.RateLimitError(
                     message="Deployment over defined rpm limit={}. current usage={}".format(
                         deployment_rpm, local_result
@@ -198,9 +269,14 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
             else:
                 # if local result below limit, check redis ## prevent unnecessary redis checks
                 result = await self._increment_value_in_current_window(key=rpm_key, value=1, ttl=self.routing_args.ttl)
-                if result is not None and result > deployment_rpm:
+                effective_result = _effective_sliding_window_count(
+                    result, local_previous, sliding_window_keys.previous_weight
+                )
+                if effective_result > deployment_rpm:
                     raise litellm.RateLimitError(
-                        message="Deployment over defined rpm limit={}. current usage={}".format(deployment_rpm, result),
+                        message="Deployment over defined rpm limit={}. current usage={}".format(
+                            deployment_rpm, effective_result
+                        ),
                         llm_provider="",
                         model=deployment.get("litellm_params", {}).get("model"),
                         response=httpx.Response(
@@ -208,7 +284,7 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
                             content="{} rpm limit={}. current usage={}".format(
                                 RouterErrors.user_defined_ratelimit_error.value,
                                 deployment_rpm,
-                                result,
+                                effective_result,
                             ),
                             headers={"retry-after": str(60)},  # type: ignore
                             request=httpx.Request(
@@ -446,31 +522,43 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
         )
 
         dt = get_utc_datetime()
-        current_minute = dt.strftime("%H-%M")
 
-        tpm_keys = []
-        rpm_keys = []
-        for m in healthy_deployments:
-            if isinstance(m, dict):
-                id = m.get("model_info", {}).get(
-                    "id"
-                )  # a deployment should always have an 'id'. this is set in router.py
-                deployment_name = m.get("litellm_params", {}).get("model")
-                tpm_key = "{}:{}:tpm:{}".format(id, deployment_name, current_minute)
-                rpm_key = "{}:{}:rpm:{}".format(id, deployment_name, current_minute)
+        deployment_ids_and_names: tuple[tuple[Any, Any], ...] = tuple(
+            (_get_nested(m, "model_info", "id"), _get_nested(m, "litellm_params", "model"))
+            for m in healthy_deployments
+            if isinstance(m, dict)
+        )
+        deployment_sliding_keys: tuple[tuple[SlidingWindowCacheKeys, SlidingWindowCacheKeys], ...] = tuple(
+            (
+                _build_sliding_window_keys(model_id=model_id, deployment_name=deployment_name, metric="tpm", dt=dt),
+                _build_sliding_window_keys(model_id=model_id, deployment_name=deployment_name, metric="rpm", dt=dt),
+            )
+            for model_id, deployment_name in deployment_ids_and_names
+        )
 
-                tpm_keys.append(tpm_key)
-                rpm_keys.append(rpm_key)
+        tpm_keys = [tpm.current_key for tpm, _ in deployment_sliding_keys]
+        rpm_keys = [rpm.current_key for _, rpm in deployment_sliding_keys]
+        previous_tpm_keys = [tpm.previous_key for tpm, _ in deployment_sliding_keys]
+        previous_rpm_keys = [rpm.previous_key for _, rpm in deployment_sliding_keys]
 
-        combined_tpm_rpm_keys = tpm_keys + rpm_keys
+        n = len(tpm_keys)
+        combined_keys = tpm_keys + rpm_keys + previous_tpm_keys + previous_rpm_keys
 
-        combined_tpm_rpm_values = await self.router_cache.async_batch_get_cache(
-            keys=combined_tpm_rpm_keys
-        )  # [1, 2, None, ..]
+        combined_values = await self.router_cache.async_batch_get_cache(keys=combined_keys)  # [1, 2, None, ..]
 
-        if combined_tpm_rpm_values is not None:
-            tpm_values = combined_tpm_rpm_values[: len(tpm_keys)]
-            rpm_values = combined_tpm_rpm_values[len(tpm_keys) :]
+        if combined_values is not None:
+            tpm_values = [
+                _effective_sliding_window_count(current, previous, tpm.previous_weight)
+                for current, previous, (tpm, _) in zip(
+                    combined_values[:n], combined_values[2 * n : 3 * n], deployment_sliding_keys
+                )
+            ]
+            rpm_values = [
+                _effective_sliding_window_count(current, previous, rpm.previous_weight)
+                for current, previous, (_, rpm) in zip(
+                    combined_values[n : 2 * n], combined_values[3 * n :], deployment_sliding_keys
+                )
+            ]
         else:
             tpm_values = None
             rpm_values = None
@@ -495,30 +583,12 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
             for index, _deployment in enumerate(healthy_deployments):
                 if isinstance(_deployment, dict):
                     id = _deployment.get("model_info", {}).get("id")
-                    ### GET DEPLOYMENT TPM LIMIT ###
-                    _deployment_tpm = None
-                    if _deployment_tpm is None:
-                        _deployment_tpm = _deployment.get("tpm", None)
-                    if _deployment_tpm is None:
-                        _deployment_tpm = _deployment.get("litellm_params", {}).get("tpm", None)
-                    if _deployment_tpm is None:
-                        _deployment_tpm = _deployment.get("model_info", {}).get("tpm", None)
-                    if _deployment_tpm is None:
-                        _deployment_tpm = float("inf")
+                    _deployment_tpm = _get_deployment_rate_limit(_deployment, "tpm")
 
                     ### GET CURRENT TPM ###
                     current_tpm = tpm_values[index] if tpm_values else 0
 
-                    ### GET DEPLOYMENT TPM LIMIT ###
-                    _deployment_rpm = None
-                    if _deployment_rpm is None:
-                        _deployment_rpm = _deployment.get("rpm", None)
-                    if _deployment_rpm is None:
-                        _deployment_rpm = _deployment.get("litellm_params", {}).get("rpm", None)
-                    if _deployment_rpm is None:
-                        _deployment_rpm = _deployment.get("model_info", {}).get("rpm", None)
-                    if _deployment_rpm is None:
-                        _deployment_rpm = float("inf")
+                    _deployment_rpm = _get_deployment_rate_limit(_deployment, "rpm")
 
                     ### GET CURRENT RPM ###
                     current_rpm = rpm_values[index] if rpm_values else 0
@@ -561,27 +631,53 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
         )
 
         dt = get_utc_datetime()
-        current_minute = dt.strftime("%H-%M")
-        tpm_keys = []
-        rpm_keys = []
-        for m in healthy_deployments:
-            if isinstance(m, dict):
-                id = m.get("model_info", {}).get(
-                    "id"
-                )  # a deployment should always have an 'id'. this is set in router.py
-                deployment_name = m.get("litellm_params", {}).get("model")
-                tpm_key = "{}:{}:tpm:{}".format(id, deployment_name, current_minute)
-                rpm_key = "{}:{}:rpm:{}".format(id, deployment_name, current_minute)
 
-                tpm_keys.append(tpm_key)
-                rpm_keys.append(rpm_key)
+        deployment_ids_and_names: tuple[tuple[Any, Any], ...] = tuple(
+            (_get_nested(m, "model_info", "id"), _get_nested(m, "litellm_params", "model"))
+            for m in healthy_deployments
+            if isinstance(m, dict)
+        )
+        deployment_sliding_keys: tuple[tuple[SlidingWindowCacheKeys, SlidingWindowCacheKeys], ...] = tuple(
+            (
+                _build_sliding_window_keys(model_id=model_id, deployment_name=deployment_name, metric="tpm", dt=dt),
+                _build_sliding_window_keys(model_id=model_id, deployment_name=deployment_name, metric="rpm", dt=dt),
+            )
+            for model_id, deployment_name in deployment_ids_and_names
+        )
 
-        tpm_values = self.router_cache.batch_get_cache(
+        tpm_keys = [tpm.current_key for tpm, _ in deployment_sliding_keys]
+        rpm_keys = [rpm.current_key for _, rpm in deployment_sliding_keys]
+        previous_tpm_keys = [tpm.previous_key for tpm, _ in deployment_sliding_keys]
+        previous_rpm_keys = [rpm.previous_key for _, rpm in deployment_sliding_keys]
+
+        current_tpm_values = self.router_cache.batch_get_cache(
             keys=tpm_keys, parent_otel_span=parent_otel_span
         )  # [1, 2, None, ..]
-        rpm_values = self.router_cache.batch_get_cache(
-            keys=rpm_keys, parent_otel_span=parent_otel_span
-        )  # [1, 2, None, ..]
+        current_rpm_values = self.router_cache.batch_get_cache(keys=rpm_keys, parent_otel_span=parent_otel_span)
+        previous_tpm_values = self.router_cache.batch_get_cache(
+            keys=previous_tpm_keys, parent_otel_span=parent_otel_span
+        )
+        previous_rpm_values = self.router_cache.batch_get_cache(
+            keys=previous_rpm_keys, parent_otel_span=parent_otel_span
+        )
+
+        if (
+            current_tpm_values is not None
+            and current_rpm_values is not None
+            and previous_tpm_values is not None
+            and previous_rpm_values is not None
+        ):
+            tpm_values = [
+                _effective_sliding_window_count(current, previous, tpm.previous_weight)
+                for current, previous, (tpm, _) in zip(current_tpm_values, previous_tpm_values, deployment_sliding_keys)
+            ]
+            rpm_values = [
+                _effective_sliding_window_count(current, previous, rpm.previous_weight)
+                for current, previous, (_, rpm) in zip(current_rpm_values, previous_rpm_values, deployment_sliding_keys)
+            ]
+        else:
+            tpm_values = None
+            rpm_values = None
 
         deployment = self._common_checks_available_deployment(
             model_group=model_group,
@@ -603,30 +699,12 @@ class LowestTPMLoggingHandler_v2(BaseRoutingStrategy, CustomLogger):
             for index, _deployment in enumerate(healthy_deployments):
                 if isinstance(_deployment, dict):
                     id = _deployment.get("model_info", {}).get("id")
-                    ### GET DEPLOYMENT TPM LIMIT ###
-                    _deployment_tpm = None
-                    if _deployment_tpm is None:
-                        _deployment_tpm = _deployment.get("tpm", None)
-                    if _deployment_tpm is None:
-                        _deployment_tpm = _deployment.get("litellm_params", {}).get("tpm", None)
-                    if _deployment_tpm is None:
-                        _deployment_tpm = _deployment.get("model_info", {}).get("tpm", None)
-                    if _deployment_tpm is None:
-                        _deployment_tpm = float("inf")
+                    _deployment_tpm = _get_deployment_rate_limit(_deployment, "tpm")
 
                     ### GET CURRENT TPM ###
                     current_tpm = tpm_values[index] if tpm_values else 0
 
-                    ### GET DEPLOYMENT TPM LIMIT ###
-                    _deployment_rpm = None
-                    if _deployment_rpm is None:
-                        _deployment_rpm = _deployment.get("rpm", None)
-                    if _deployment_rpm is None:
-                        _deployment_rpm = _deployment.get("litellm_params", {}).get("rpm", None)
-                    if _deployment_rpm is None:
-                        _deployment_rpm = _deployment.get("model_info", {}).get("rpm", None)
-                    if _deployment_rpm is None:
-                        _deployment_rpm = float("inf")
+                    _deployment_rpm = _get_deployment_rate_limit(_deployment, "rpm")
 
                     ### GET CURRENT RPM ###
                     current_rpm = rpm_values[index] if rpm_values else 0

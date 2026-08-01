@@ -7,7 +7,7 @@ import random
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict
 from dotenv import load_dotenv
 
@@ -777,3 +777,38 @@ async def test_tpm_rpm_routing_model_name_checks():
             standard_logging_payload["hidden_params"]["litellm_model_name"]
             == "azure/gpt-4.1-mini"
         )
+
+
+@pytest.mark.asyncio
+async def test_async_pre_call_check_sliding_window_rollover():
+    """
+    Regression test: a request landing at :59.5 of one minute and another at
+    :00.5 of the next minute are only ~1s apart in real time, so the second
+    one must still be counted against the still-active overlap from the
+    first minute's bucket (sliding window), not treated as a fresh,
+    unused fixed-window bucket.
+    """
+    test_cache = DualCache()
+    lowest_tpm_logger = LowestTPMLoggingHandler(router_cache=test_cache)
+    deployment = {
+        "model_name": "gpt-3.5-turbo",
+        "litellm_params": {"model": "azure/gpt-4.1-mini", "rpm": 1},
+        "model_info": {"id": "sliding-window-rollover-test"},
+    }
+
+    minute_a_end = datetime(2024, 1, 1, 10, 30, 59, 500000, tzinfo=timezone.utc)
+    minute_b_start = datetime(2024, 1, 1, 10, 31, 0, 500000, tzinfo=timezone.utc)
+
+    with patch(
+        "litellm.router_strategy.lowest_tpm_rpm_v2.get_utc_datetime",
+        side_effect=[minute_a_end, minute_b_start],
+    ):
+        first_result = await lowest_tpm_logger.async_pre_call_check(
+            deployment=deployment, parent_otel_span=None
+        )
+        assert first_result is not None
+
+        with pytest.raises(litellm.RateLimitError):
+            await lowest_tpm_logger.async_pre_call_check(
+                deployment=deployment, parent_otel_span=None
+            )
