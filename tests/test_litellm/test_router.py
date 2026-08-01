@@ -2662,6 +2662,90 @@ def test_completion_streaming_iterator_surfaces_rate_limit_without_fallbacks():
 
 
 @pytest.mark.asyncio
+async def test_acompletion_streaming_holds_max_parallel_requests_semaphore_until_consumed():
+    """Regression: with max_parallel_requests=1, the semaphore guarding a
+    deployment must stay held for a streaming call until its stream is fully
+    consumed, not just until litellm.acompletion() resolves to the
+    CustomStreamWrapper. A second call to the same deployment must block
+    while the first stream is still mid-iteration, and only proceed once the
+    first stream is exhausted."""
+    from litellm.utils import CustomStreamWrapper
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "stream-model",
+                "litellm_params": {
+                    "model": "gpt-4",
+                    "api_key": "fake-key",
+                    "max_parallel_requests": 1,
+                },
+            },
+        ],
+        num_retries=0,
+    )
+
+    hold_first_stream_open = asyncio.Event()
+
+    class _ControlledAsyncIterator:
+        def __init__(self):
+            self._yielded_first_chunk = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._yielded_first_chunk:
+                self._yielded_first_chunk = True
+                return MagicMock(choices=[MagicMock(delta=MagicMock(content="chunk"))])
+            await hold_first_stream_open.wait()
+            raise StopAsyncIteration
+
+    class _FakeStreamWrapper(CustomStreamWrapper):
+        def __init__(self, completion_stream):
+            self.completion_stream = completion_stream
+            self.model = "gpt-4"
+            self.custom_llm_provider = "openai"
+            self.logging_obj = MagicMock()
+            self.chunks = []
+            self._hidden_params = {}
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self.completion_stream.__anext__()
+
+    async def _fake_acompletion(*args, **kwargs):
+        return _FakeStreamWrapper(_ControlledAsyncIterator())
+
+    with patch("litellm.acompletion", side_effect=_fake_acompletion):
+        first_stream = await router.acompletion(
+            model="stream-model",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+        await first_stream.__anext__()  # consume the 1 available chunk; stream is still open
+
+        second_call = asyncio.create_task(
+            router.acompletion(
+                model="stream-model",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+        )
+        await asyncio.sleep(0.2)
+        assert not second_call.done()
+
+        hold_first_stream_open.set()
+        with pytest.raises(StopAsyncIteration):
+            await first_stream.__anext__()
+
+        second_stream = await asyncio.wait_for(second_call, timeout=5)
+        assert second_stream is not None
+
+
+@pytest.mark.asyncio
 async def test_aresponses_streaming_iterator_surfaces_rate_limit_without_fallbacks():
     """Responses-API counterpart of
     test_acompletion_streaming_iterator_surfaces_rate_limit_without_fallbacks."""

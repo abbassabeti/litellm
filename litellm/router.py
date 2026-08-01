@@ -2076,6 +2076,7 @@ class Router:
         model_response: CustomStreamWrapper,
         messages: List[Dict[str, str]],
         initial_kwargs: dict,
+        rpm_semaphore: asyncio.Semaphore | None = None,
     ) -> CustomStreamWrapper:
         """
         Helper to iterate over a streaming response.
@@ -2191,6 +2192,8 @@ class Router:
                         raise fallback_error.original_exception from fallback_error
                     raise fallback_error
             finally:
+                if rpm_semaphore is not None:
+                    rpm_semaphore.release()
                 # Close the underlying streams to release HTTP connections
                 # back to the connection pool when the generator is closed
                 # (e.g. on client disconnect).
@@ -2870,26 +2873,27 @@ class Router:
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment,
-                        logging_obj=logging_obj,
-                        parent_otel_span=parent_otel_span,
-                    )
-                    response = await _response
-            else:
+            semaphore: asyncio.Semaphore | None = (
+                rpm_semaphore if isinstance(rpm_semaphore, asyncio.Semaphore) else None
+            )
+            if semaphore is not None:
+                await semaphore.acquire()
+
+            try:
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment,
                     logging_obj=logging_obj,
                     parent_otel_span=parent_otel_span,
                 )
-
                 response = await _response
+            except BaseException:
+                if semaphore is not None:
+                    semaphore.release()
+                raise
+
+            is_streaming_response = isinstance(response, CustomStreamWrapper)
+            if semaphore is not None and not is_streaming_response:
+                semaphore.release()
 
             ## CHECK CONTENT FILTER ERROR ##
             if isinstance(response, ModelResponse):
@@ -2910,11 +2914,12 @@ class Router:
                 parent_otel_span=parent_otel_span,
             )
 
-            if isinstance(response, CustomStreamWrapper):
+            if is_streaming_response:
                 return await self._acompletion_streaming_iterator(
                     model_response=response,
                     messages=messages,
                     initial_kwargs=input_kwargs_for_streaming_fallback,
+                    rpm_semaphore=semaphore,
                 )
 
             return response
