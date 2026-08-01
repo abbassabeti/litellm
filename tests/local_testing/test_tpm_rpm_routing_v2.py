@@ -178,6 +178,93 @@ def test_get_available_deployments():
 # test_get_available_deployments()
 
 
+def test_log_success_event_streaming_missing_litellm_model_name():
+    """
+    Regression test: for a streaming response, standard_logging_object's
+    hidden_params["litellm_model_name"] is None (only kwargs["litellm_params"]
+    ["metadata"]["deployment"] reliably carries the deployment's model string
+    in that case). log_success_event must still derive the tpm cache key
+    using that value; if it falls back to the None from hidden_params
+    instead, the increment silently no-ops (or, without the model-is-None
+    guard, writes to a "<id>:None:tpm:<minute>" key the read side never
+    looks at), so usage from streaming calls never counts against the
+    deployment's budget.
+    """
+    test_cache = DualCache()
+    model_list = [
+        {
+            "model_name": "gpt-3.5-turbo",
+            "litellm_params": {"model": "azure/gpt-4.1-mini"},
+            "model_info": {"id": "1234"},
+        },
+        {
+            "model_name": "gpt-3.5-turbo",
+            "litellm_params": {"model": "azure/gpt-4.1-mini"},
+            "model_info": {"id": "5678"},
+        },
+    ]
+    lowest_tpm_logger = LowestTPMLoggingHandler(router_cache=test_cache)
+    model_group = "gpt-3.5-turbo"
+    deployment = "azure/gpt-4.1-mini"
+
+    total_tokens = 5000
+    deployment_id = "1234"
+    standard_logging_payload = create_standard_logging_payload()
+    standard_logging_payload["model_group"] = model_group
+    standard_logging_payload["model_id"] = deployment_id
+    standard_logging_payload["total_tokens"] = total_tokens
+    standard_logging_payload["hidden_params"]["litellm_model_name"] = None
+    kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "model_group": model_group,
+                "deployment": deployment,
+            },
+            "model_info": {"id": deployment_id},
+        },
+        "standard_logging_object": standard_logging_payload,
+    }
+    lowest_tpm_logger.log_success_event(
+        response_obj={"usage": {"total_tokens": total_tokens}},
+        kwargs=kwargs,
+        start_time=time.time(),
+        end_time=time.time(),
+    )
+
+    total_tokens = 20
+    deployment_id = "5678"
+    standard_logging_payload = create_standard_logging_payload()
+    standard_logging_payload["model_group"] = model_group
+    standard_logging_payload["model_id"] = deployment_id
+    standard_logging_payload["total_tokens"] = total_tokens
+    standard_logging_payload["hidden_params"]["litellm_model_name"] = deployment
+    kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "model_group": model_group,
+                "deployment": deployment,
+            },
+            "model_info": {"id": deployment_id},
+        },
+        "standard_logging_object": standard_logging_payload,
+    }
+    lowest_tpm_logger.log_success_event(
+        response_obj={"usage": {"total_tokens": total_tokens}},
+        kwargs=kwargs,
+        start_time=time.time(),
+        end_time=time.time(),
+    )
+
+    assert (
+        lowest_tpm_logger.get_available_deployments(
+            model_group=model_group,
+            healthy_deployments=model_list,
+            input=["Hello world"],
+        )["model_info"]["id"]
+        == "5678"
+    )
+
+
 def test_router_get_available_deployments():
     """
     Test if routers 'get_available_deployments' returns the lowest tpm deployment
